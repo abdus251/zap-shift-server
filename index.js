@@ -1,21 +1,25 @@
-const jwt = require('jsonwebtoken')
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb')
 const express = require('express')
 const cors = require('cors')
 const dotenv = require('dotenv')
+const jwt = require('jsonwebtoken')
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb')
 const admin = require('firebase-admin')
+const stripe = require('stripe')
+
+// Load env
 dotenv.config()
 
-const stripe = require('stripe')(process.env.PAYMENT_GATEWAY_KEY)
-
+// -------------------- EXPRESS APP --------------------
 const app = express()
 const port = process.env.PORT || 5000
 
 app.use(cors())
 app.use(express.json())
 
+// -------------------- JWT ROUTE --------------------
 app.post('/jwt', (req, res) => {
   const { email } = req.body
+  if (!email) return res.status(400).send({ message: 'Email required' })
 
   const token = jwt.sign({ email }, process.env.JWT_SECRET, {
     expiresIn: '7d',
@@ -24,15 +28,22 @@ app.post('/jwt', (req, res) => {
   res.send({ token })
 })
 
-const serviceAccount = JSON.parse(
-  Buffer.from(process.env.FB_SERVICE_KEY_BASE64, 'base64').toString('utf8'),
-)
+// -------------------- FIREBASE ADMIN --------------------
+try {
+  const serviceAccount = JSON.parse(
+    Buffer.from(process.env.FB_SERVICE_KEY_BASE64, 'base64').toString('utf8'),
+  )
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-})
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  })
+  console.log('✅ Firebase Admin initialized')
+} catch (err) {
+  console.error('❌ Firebase Admin init failed:', err)
+}
+
+// -------------------- MONGODB --------------------
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.u8om2pp.mongodb.net/?appName=Cluster0`
-
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -43,90 +54,49 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    // await client.connect()
+    await client.connect()
     console.log('✅ MongoDB connected')
 
     const db = client.db('parcelDB')
     const userCollection = db.collection('users')
     const parcelsCollection = db.collection('parcels')
-    // const trackingsCollection = db.collection('trackings')
-    const paymentCollection = db.collection('payments')
     const trackingCollection = db.collection('tracking')
+    const paymentCollection = db.collection('payments')
     const ridersCollection = db.collection('riders')
-    // custom middleware
 
-    async function updateParcelStatus(id, status, extraFields = {}) {
-      // ✅ Prevent crash
-      if (!ObjectId.isValid(id)) {
-        throw new Error('Invalid parcel ID')
-      }
-
-      const filter = { _id: new ObjectId(id) }
-
-      const updateDoc = {
-        $set: {
-          deliveryStatus: status,
-          ...extraFields,
-        },
-        $push: {
-          history: {
-            status,
-            timestamp: new Date(),
-          },
-        },
-      }
-
-      const result = await parcelsCollection.updateOne(filter, updateDoc)
-
-      if (result.matchedCount === 0) {
-        throw new Error('Parcel not found')
-      }
-
-      return result
-    }
+    // -------------------- MIDDLEWARE --------------------
     const verifyFBToken = async (req, res, next) => {
       const authHeader = req.headers.authorization
-      if (!authHeader) {
-        return res.status(401).send({ message: 'Unauthorized access' })
-      }
-      const token = authHeader.split(' ')[1]
-      if (!token) {
-        return res.status(401).send({ message: 'Unauthorized access' })
-      }
+      if (!authHeader) return res.status(401).send({ message: 'Unauthorized' })
 
-      // verify token
+      const token = authHeader.split(' ')[1]
+      if (!token) return res.status(401).send({ message: 'Unauthorized' })
+
       try {
         const decoded = await admin.auth().verifyIdToken(token)
         req.decoded = decoded
         next()
-      } catch (error) {
-        return res.status(401).send({ message: 'Unauthorized access' })
+      } catch {
+        return res.status(401).send({ message: 'Unauthorized' })
       }
     }
 
-    const serviceAccount = JSON.parse(
-      Buffer.from(process.env.FB_SERVICE_KEY_BASE64, 'base64').toString('utf8'),
-    )
-
     const verifyAdmin = async (req, res, next) => {
       const email = req.decoded.email
-      const query = { email }
-      const user = await userCollection.findOne(query)
-      if (!user || user.role !== 'admin') {
-        return res.status(403).send({ message: 'Forbidden: Admin access only' })
-      }
+      const user = await userCollection.findOne({ email })
+      if (!user || user.role !== 'admin')
+        return res.status(403).send({ message: 'Forbidden' })
       next()
     }
 
     const verifyRider = async (req, res, next) => {
       const email = req.decoded.email
-      const query = { email }
-      const user = await userCollection.findOne(query)
-      if (!user || user.role !== 'rider') {
-        return res.status(403).send({ message: 'Forbidden: Rider access only' })
-      }
+      const user = await userCollection.findOne({ email })
+      if (!user || user.role !== 'rider')
+        return res.status(403).send({ message: 'Forbidden' })
       next()
     }
+
     // ======================
     // PARCEL ROUTES
     // ======================
