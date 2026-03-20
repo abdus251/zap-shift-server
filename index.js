@@ -5,6 +5,7 @@ const dotenv = require('dotenv')
 const admin = require('firebase-admin')
 dotenv.config()
 
+const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '7d' })
 const stripe = require('stripe')(process.env.PAYMENT_GATEWAY_KEY)
 
 const app = express()
@@ -90,6 +91,10 @@ async function run() {
         return res.status(401).send({ message: 'Unauthorized access' })
       }
     }
+
+    const serviceAccount = JSON.parse(
+      Buffer.from(process.env.FB_SERVICE_KEY_BASE64, 'base64').toString('utf8'),
+    )
 
     const verifyAdmin = async (req, res, next) => {
       const email = req.decoded.email
