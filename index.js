@@ -1,22 +1,21 @@
+require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const dotenv = require('dotenv')
 const jwt = require('jsonwebtoken')
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb')
 const admin = require('firebase-admin')
-const stripe = require('stripe')
+const stripe = require('stripe')(process.env.PAYMENT_GATEWAY_KEY)
 
-// Load env
 dotenv.config()
 
-// -------------------- EXPRESS APP --------------------
 const app = express()
 const port = process.env.PORT || 5000
 
 app.use(cors())
 app.use(express.json())
 
-// -------------------- JWT ROUTE --------------------
+// ---------------- JWT ----------------
 app.post('/jwt', (req, res) => {
   const { email } = req.body
   if (!email) return res.status(400).send({ message: 'Email required' })
@@ -28,7 +27,7 @@ app.post('/jwt', (req, res) => {
   res.send({ token })
 })
 
-// -------------------- FIREBASE ADMIN --------------------
+// ---------------- FIREBASE ----------------
 try {
   const serviceAccount = JSON.parse(
     Buffer.from(process.env.FB_SERVICE_KEY_BASE64, 'base64').toString('utf8'),
@@ -37,13 +36,15 @@ try {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   })
+
   console.log('✅ Firebase Admin initialized')
 } catch (err) {
-  console.error('❌ Firebase Admin init failed:', err)
+  console.error('❌ Firebase init failed:', err)
 }
 
-// -------------------- MONGODB --------------------
+// ---------------- DB ----------------
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.u8om2pp.mongodb.net/?appName=Cluster0`
+
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -58,48 +59,93 @@ async function run() {
     console.log('✅ MongoDB connected')
 
     const db = client.db('parcelDB')
+
     const userCollection = db.collection('users')
     const parcelsCollection = db.collection('parcels')
     const trackingCollection = db.collection('tracking')
     const paymentCollection = db.collection('payments')
     const ridersCollection = db.collection('riders')
 
-    // -------------------- MIDDLEWARE --------------------
+    // ---------------- HELPER ----------------
+    async function updateParcelStatus(id, status, extraFields = {}) {
+      if (!ObjectId.isValid(id)) throw new Error('Invalid ID')
+
+      return await parcelsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            deliveryStatus: status,
+            ...extraFields,
+          },
+          $push: {
+            history: {
+              status,
+              timestamp: new Date(),
+            },
+          },
+        },
+      )
+    }
+
+    // ---------------- MIDDLEWARE ----------------
     const verifyFBToken = async (req, res, next) => {
       const authHeader = req.headers.authorization
       if (!authHeader) return res.status(401).send({ message: 'Unauthorized' })
 
       const token = authHeader.split(' ')[1]
-      if (!token) return res.status(401).send({ message: 'Unauthorized' })
 
       try {
         const decoded = await admin.auth().verifyIdToken(token)
         req.decoded = decoded
         next()
       } catch {
-        return res.status(401).send({ message: 'Unauthorized' })
+        res.status(401).send({ message: 'Unauthorized' })
       }
     }
 
     const verifyAdmin = async (req, res, next) => {
-      const email = req.decoded.email
-      const user = await userCollection.findOne({ email })
+      const user = await userCollection.findOne({
+        email: req.decoded.email,
+      })
       if (!user || user.role !== 'admin')
         return res.status(403).send({ message: 'Forbidden' })
       next()
     }
 
     const verifyRider = async (req, res, next) => {
-      const email = req.decoded.email
-      const user = await userCollection.findOne({ email })
+      const user = await userCollection.findOne({
+        email: req.decoded.email,
+      })
       if (!user || user.role !== 'rider')
         return res.status(403).send({ message: 'Forbidden' })
       next()
     }
 
-    // ======================
-    // PARCEL ROUTES
-    // ======================
+    // ---------------- ROUTES ----------------
+
+    // USERS
+    app.post('/users', async (req, res) => {
+      const email = req.body.email
+      const exists = await userCollection.findOne({ email })
+
+      if (exists) {
+        await userCollection.updateOne(
+          { email },
+          { $set: { lastLogin: new Date() } },
+        )
+        return res.send({ inserted: false })
+      }
+
+      const result = await userCollection.insertOne(req.body)
+      res.send({ insertedId: result.insertedId })
+    })
+
+    app.get('/users/:email/role', async (req, res) => {
+      const user = await userCollection.findOne({
+        email: req.params.email,
+      })
+      res.send({ role: user?.role || 'user' })
+    })
 
     app.patch(
       '/users/:id/role',
@@ -126,19 +172,113 @@ async function run() {
       },
     )
 
+    app.get('/users/search', async (req, res) => {
+      const emailQuery = req.query.email
+      if (!emailQuery) {
+        return res
+          .status(400)
+          .send({ message: 'Email query parameter is required' })
+      }
+
+      const regex = new RegExp(emailQuery, 'i') // Case-insensitive search
+
+      try {
+        const users = await userCollection
+          .find({ email: { $regex: regex } })
+          .project({ email: 1, createdAt: 1, role: 1 })
+          .limit(10)
+          .toArray()
+        res.send(users)
+      } catch (error) {
+        console.error('❌ Error searching users:', error)
+        res.status(500).send({ message: 'Failed to search users' })
+      }
+    })
+
+    app.get('/user/status-count', verifyFBToken, async (req, res) => {
+      try {
+        const email = req.decoded.email
+
+        const result = await parcelsCollection
+          .aggregate([
+            {
+              $match: {
+                email: email, // user email
+              },
+            },
+            {
+              $group: {
+                _id: '$deliveryStatus',
+                count: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray()
+
+        const statusCount = {
+          created: 0,
+          rider_assigned: 0,
+          in_transit: 0,
+          delivered: 0,
+        }
+
+        result.forEach((item) => {
+          statusCount[item._id] = item.count
+        })
+
+        res.send(statusCount)
+      } catch (error) {
+        console.error(error)
+        res.status(500).send({ message: 'Failed to get user stats' })
+      }
+    })
+
+    // PARCELS
+    app.post('/parcels', async (req, res) => {
+      const parcel = req.body
+      parcel.createdAt = new Date()
+
+      const result = await parcelsCollection.insertOne(parcel)
+      res.send(result)
+    })
+
     app.get('/parcels', async (req, res) => {
       const { email, paymentStatus, deliveryStatus } = req.query
 
       const query = {}
-
-      // Optional filters
       if (email) query.email = email
       if (paymentStatus) query.paymentStatus = paymentStatus
       if (deliveryStatus) query.deliveryStatus = deliveryStatus
 
       const result = await parcelsCollection.find(query).toArray()
+      res.send(result)
+    })
 
-      res.send({ success: true, data: result })
+    app.get('/parcels/paid', async (req, res) => {
+      const result = await parcelsCollection
+        .find({ paymentStatus: 'paid' })
+        .toArray()
+      res.send(result)
+    })
+
+    app.get('/parcels/:id', async (req, res) => {
+      const id = req.params.id
+      if (!ObjectId.isValid(id))
+        return res.status(400).send({ message: 'Invalid ID' })
+
+      const parcel = await parcelsCollection.findOne({
+        _id: new ObjectId(id),
+      })
+      res.send(parcel)
+    })
+
+    app.patch('/parcels/pay/:id', async (req, res) => {
+      await updateParcelStatus(req.params.id, 'paid')
+      await parcelsCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { paymentStatus: 'paid' } },
+      )
+      res.send({ success: true })
     })
 
     app.patch(
@@ -206,53 +346,6 @@ async function run() {
       },
     )
 
-    app.get('/parcels/delivery/status-count', async (req, res) => {
-      const pipeline = [
-        {
-          $group: {
-            _id: '$deliveryStatus',
-            count: {
-              $sum: 1,
-            },
-          },
-        },
-        {
-          $project: {
-            status: '$_id',
-            count: 1,
-            _id: 0,
-          },
-        },
-      ]
-
-      const result = await parcelsCollection.aggregate(pipeline).toArray()
-
-      res.send(result)
-    })
-
-    app.get('/track/:trackingNumber', async (req, res) => {
-      const parcel = await parcelsCollection.findOne({
-        trackingNumber: req.params.trackingNumber,
-      })
-      if (!parcel)
-        return res
-          .status(404)
-          .send({ success: false, message: 'Parcel not found' })
-
-      res.send({
-        success: true,
-        parcelName: parcel.parcelName,
-        currentStatus: parcel.deliveryStatus,
-        history: parcel.history,
-        assignedRider: parcel.assignedRiderName
-          ? {
-              name: parcel.assignedRiderName,
-              email: parcel.assignedRiderEmail,
-            }
-          : null,
-      })
-    })
-
     app.patch('/parcels/:id/status', async (req, res) => {
       const { id } = req.params
       const { deliveryStatus } = req.body
@@ -288,322 +381,43 @@ async function run() {
       }
     })
 
-    app.get('/users/:email/role', async (req, res) => {
-      const email = req.params.email
-      try {
-        const email = req.params.email
-
-        if (!email) {
-          return res.status(400).send({ message: 'Email is required' })
-        }
-
-        const user = await userCollection.findOne({ email })
-
-        if (!user) {
-          return res.status(404).send({ message: 'User not found' })
-        }
-        res.send({ role: user.role || 'user' })
-      } catch (error) {
-        console.error('Error getting user role:', error)
-        res.status(500).send({ message: 'Failed to get user role' })
-      }
-    })
-
-    app.post('/users', async (req, res) => {
-      const email = req.body.email
-      const userExists = await userCollection.findOne({ email })
-
-      if (userExists) {
-        // update last login
-        await userCollection.updateOne(
-          { email },
-          { $set: { lastLogin: new Date() } },
-        )
-
-        return res.send({
-          message: 'User already exists',
-          inserted: false,
-        })
-      }
-
-      const user = req.body
-      const result = await userCollection.insertOne(user)
-
-      res.status(201).send({
-        success: true,
-        insertedId: result.insertedId,
-      })
-    })
-
-    app.get('/users/search', async (req, res) => {
-      const emailQuery = req.query.email
-      if (!emailQuery) {
-        return res
-          .status(400)
-          .send({ message: 'Email query parameter is required' })
-      }
-
-      const regex = new RegExp(emailQuery, 'i') // Case-insensitive search
-
-      try {
-        const users = await userCollection
-          .find({ email: { $regex: regex } })
-          .project({ email: 1, createdAt: 1, role: 1 })
-          .limit(10)
-          .toArray()
-        res.send(users)
-      } catch (error) {
-        console.error('❌ Error searching users:', error)
-        res.status(500).send({ message: 'Failed to search users' })
-      }
-    })
-
-    app.get('/user/status-count', verifyFBToken, async (req, res) => {
-      try {
-        const email = req.decoded.email
-
-        const result = await parcelsCollection
-          .aggregate([
-            {
-              $match: {
-                email: email, // user email
-              },
+    app.get('/parcels/delivery/status-count', async (req, res) => {
+      const pipeline = [
+        {
+          $group: {
+            _id: '$deliveryStatus',
+            count: {
+              $sum: 1,
             },
-            {
-              $group: {
-                _id: '$deliveryStatus',
-                count: { $sum: 1 },
-              },
-            },
-          ])
-          .toArray()
+          },
+        },
+        {
+          $project: {
+            status: '$_id',
+            count: 1,
+            _id: 0,
+          },
+        },
+      ]
 
-        const statusCount = {
-          created: 0,
-          rider_assigned: 0,
-          in_transit: 0,
-          delivered: 0,
-        }
-
-        result.forEach((item) => {
-          statusCount[item._id] = item.count
-        })
-
-        res.send(statusCount)
-      } catch (error) {
-        console.error(error)
-        res.status(500).send({ message: 'Failed to get user stats' })
-      }
-    })
-
-    app.get('/parcels/paid', async (req, res) => {
-      try {
-        const query = { paymentStatus: 'paid' }
-
-        const parcels = await parcelsCollection.find(query).toArray()
-
-        res.send(parcels)
-      } catch (error) {
-        res.status(500).send({ message: 'Failed to fetch parcels' })
-      }
-    })
-    app.get('/parcels/:id', async (req, res) => {
-      try {
-        const { ObjectId } = require('mongodb')
-        const id = req.params.id
-
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).send({ error: 'Invalid parcel ID' })
-        }
-
-        const parcel = await parcelsCollection.findOne({
-          _id: new ObjectId(id),
-        })
-
-        if (!parcel) {
-          return res.status(404).send({ error: 'Parcel not found' })
-        }
-
-        res.send(parcel)
-      } catch (error) {
-        console.error('GET PARCEL ERROR:', error)
-        res.status(500).send({ error: 'Internal server error' })
-      }
-    })
-
-    app.get('/trackings/:trackingId', async (req, res) => {
-      const trackingId = req.params.trackingId
-
-      const updates = await trackingsCollection
-        .find({ trackingId: trackingId })
-        .sort({ timestamp: 1 })
-        .toArray()
-
-      res.send(updates)
-    })
-
-    app.post('/trackings', async (req, res) => {
-      const update = req.body
-
-      update.timestamp = new Date()
-      if (!update.trackingId || !update.status) {
-        return res
-          .status(400)
-          .send({ message: 'Tracking ID and Status are required' })
-      }
-
-      const result = await trackingsCollection.insertOne(update)
-      res.status(201).json(result)
-    })
-
-    app.post('/riders', async (req, res) => {
-      const rider = req.body
-      const result = await ridersCollection.insertOne(rider)
-      res.status(201).send({ success: true, insertedId: result.insertedId })
-    })
-    // get rider parcels
-    app.get('/rider/parcels', verifyFBToken, verifyRider, async (req, res) => {
-      try {
-        const email = req.query.email
-
-        if (!email) {
-          return res.status(400).send({ message: 'Email is required' })
-        }
-
-        const query = {
-          assignedRiderEmail: email,
-          deliveryStatus: { $in: ['rider_assigned', 'in_transit'] },
-        }
-
-        const options = {
-          sort: { creationDate: -1 },
-        }
-
-        const parcels = await parcelsCollection.find(query, options).toArray()
-
-        res.send(parcels)
-      } catch (error) {
-        console.error('❌ Error fetching rider parcels:', error)
-        res.status(500).send({ message: error.message })
-      }
-    })
-
-    app.get(
-      '/rider/completed-parcels',
-      verifyFBToken,
-      verifyRider,
-      async (req, res) => {
-        const email = req.decoded.email
-
-        const parcels = await parcelsCollection
-          .find({
-            assignedRiderEmail: email,
-            deliveryStatus: { $in: ['delivered', 'service_center_delivered'] },
-          })
-          .toArray()
-
-        res.send(parcels)
-      },
-    )
-
-    app.get(
-      '/rider/status-count',
-      verifyFBToken,
-      verifyRider,
-      async (req, res) => {
-        try {
-          const email = req.decoded.email
-
-          const result = await parcelsCollection
-            .aggregate([
-              {
-                $match: {
-                  assignedRiderEmail: email,
-                },
-              },
-              {
-                $group: {
-                  _id: '$deliveryStatus',
-                  count: { $sum: 1 },
-                },
-              },
-            ])
-            .toArray()
-
-          // Convert array → object
-          const statusCount = {
-            rider_assigned: 0,
-            in_transit: 0,
-            delivered: 0,
-          }
-
-          result.forEach((item) => {
-            statusCount[item._id] = item.count
-          })
-
-          res.send(statusCount)
-        } catch (error) {
-          console.error(error)
-          res.status(500).send({ message: 'Failed to get status count' })
-        }
-      },
-    )
-    // PATCH /parcels/:id/cashout
-    app.patch(
-      '/parcels/:id/cashout',
-      verifyFBToken,
-      verifyRider,
-      async (req, res) => {
-        try {
-          const { id } = req.params
-
-          const result = await parcelsCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: { cashedOut: true } },
-          )
-
-          if (result.modifiedCount > 0) {
-            return res.send({ success: true, message: 'Parcel cashed out' })
-          } else {
-            return res
-              .status(400)
-              .send({ success: false, message: 'Failed to cash out' })
-          }
-        } catch (error) {
-          console.error('❌ Cash out error:', error)
-          res.status(500).send({ message: error.message })
-        }
-      },
-    )
-
-    app.get('/rider/pending-deliveries', async (req, res) => {
-      const email = req.query.email
-
-      const result = await parcelsCollection
-        .find({
-          assignedRiderEmail: email,
-          deliveryStatus: { $in: ['rider_assigned', 'in_transit'] },
-        })
-        .toArray()
+      const result = await parcelsCollection.aggregate(pipeline).toArray()
 
       res.send(result)
     })
 
+    // RIDER
     app.get('/riders', async (req, res) => {
-      const { district, status } = req.query
-
-      const query = {}
-
-      if (district) query.district = district
-      if (status) query.status = status
-
-      const riders = await ridersCollection.find(query).toArray()
-
+      const riders = await ridersCollection.find().toArray()
       res.send(riders)
     })
 
     app.get('/riders/active', async (req, res) => {
       const result = await ridersCollection.find({ status: 'active' }).toArray()
+      res.send(result)
+    })
+
+    app.post('/riders', async (req, res) => {
+      const result = await ridersCollection.insertOne(req.body)
       res.send(result)
     })
 
@@ -637,166 +451,76 @@ async function run() {
       }
     })
 
+    // TRACKING
     app.post('/tracking', async (req, res) => {
-      const { tracking_id, parcel_id, status, message, updated_by } = req.body
-
-      const log = {
-        tracking_id,
-        parcel_id: parcel_id ? new ObjectId(parcel_id) : undefined,
-        status,
-        message,
-        time: new Date(),
-        updated_by,
-        updated_at: new Date(),
-      }
-
+      const log = { ...req.body, time: new Date() }
       const result = await trackingCollection.insertOne(log)
-
-      res.status(201).send({
-        success: true,
-        insertedId: result.insertedId,
-      })
+      res.send(result)
     })
 
-    // ======================
-    // PAYMENT ROUTES
-    // ======================
+    app.get('/tracking/:trackingId', async (req, res) => {
+      const trackingId = req.params.trackingId
 
+      const updates = await trackingsCollection
+        .find({ trackingId: trackingId })
+        .sort({ timestamp: 1 })
+        .toArray()
+
+      res.send(updates)
+    })
+
+    // PAYMENTS
     app.get('/payments', verifyFBToken, async (req, res) => {
-      console.log('headers in payment', req.headers)
-      try {
-        const userEmail = req.query.email
-        console.log('decoded', req.decoded)
-        if (req.decoded.email !== userEmail) {
-          return res.status(403).send({ message: 'Forbidden access' })
-        }
-
-        const query = userEmail ? { email: userEmail } : {}
-
-        const payments = await paymentCollection.find(query).toArray()
-        res.send(payments)
-      } catch (error) {
-        console.error('❌ Payment error:', error)
-        res.status(500).send({ message: error.message })
-      }
+      const payments = await paymentCollection
+        .find({ email: req.query.email })
+        .toArray()
+      res.send(payments)
     })
 
     app.post('/payments', async (req, res) => {
-      try {
-        const { parcelId, email, amount, paymentMethod, transactionId } =
-          req.body
+      const { parcelId, email, amount } = req.body
 
-        if (!ObjectId.isValid(parcelId)) {
-          return res.status(400).send({ message: 'Invalid parcel ID' })
-        }
-
-        const updatedResult = await parcelsCollection.updateOne(
-          { _id: new ObjectId(parcelId) },
-          { $set: { paymentStatus: 'paid' } },
-        )
-
-        if (updatedResult.modifiedCount === 0) {
-          return res.status(404).send({
-            message: 'Parcel not found or already paid',
-          })
-        }
-
-        const paymentDoc = {
-          parcelId,
-          email,
-          amount,
-          paymentMethod,
-          transactionId,
-          paid_at: new Date(),
-        }
-
-        const paymentResult = await paymentCollection.insertOne(paymentDoc)
-
-        res.send({
-          success: true,
-          paymentId: paymentResult.insertedId,
-        })
-      } catch (error) {
-        console.error('❌ Payment error:', error)
-        res.status(500).send({ message: error.message })
-      }
-    })
-  } catch (error) {
-    console.error('❌ MongoDB Error:', error)
-  }
-  app.patch('/parcels/pay/:id', async (req, res) => {
-    try {
-      const response = await updateParcelStatus(req.params.id, 'paid')
       await parcelsCollection.updateOne(
-        { _id: new ObjectId(req.params.id) },
+        { _id: new ObjectId(parcelId) },
         { $set: { paymentStatus: 'paid' } },
       )
-      res.send(response)
-    } catch (err) {
-      res.status(404).send({ success: false, message: err.message })
-    }
-  })
 
-  app.post('/create-payment-intent', async (req, res) => {
-    try {
-      let { amountInCents } = req.body
-      amountInCents = Number(amountInCents)
+      const result = await paymentCollection.insertOne({
+        parcelId,
+        email,
+        amount,
+        paid_at: new Date(),
+      })
 
-      console.log('Received amount:', amountInCents)
+      res.send(result)
+    })
 
-      if (!amountInCents || amountInCents < 50) {
-        return res.status(400).send({
-          error: 'Amount must be at least 50 cents ($0.50)',
-        })
+    // STRIPE
+    app.post('/create-payment-intent', async (req, res) => {
+      const amount = Number(req.body.amountInCents)
+
+      if (!amount || amount < 50) {
+        return res.status(400).send({ error: 'Invalid amount' })
       }
 
       const paymentIntent = await stripe.paymentIntents.create({
-        amount: amountInCents,
+        amount,
         currency: 'usd',
-        payment_method_types: ['card'],
       })
 
-      res.send({
-        clientSecret: paymentIntent.client_secret,
-      })
-    } catch (error) {
-      console.error('❌ Stripe error:', error.message)
-      res.status(500).send({ message: error.message })
-    }
-  })
-
-  app.post('/parcels', async (req, res) => {
-    try {
-      const newParcel = req.body
-
-      // Add createdAt automatically
-      newParcel.createdAt = new Date()
-
-      const db = client.db('parcelDB')
-      const parcelsCollection = db.collection('parcels')
-
-      const result = await parcelsCollection.insertOne(newParcel)
-
-      res.status(201).send({
-        success: true,
-        insertedId: result.insertedId,
-      })
-    } catch (error) {
-      console.error('❌ Error adding parcel:', error)
-      res.status(500).send({
-        success: false,
-        error: error.message,
-      })
-    }
-  })
+      res.send({ clientSecret: paymentIntent.client_secret })
+    })
+  } catch (err) {
+    console.error(err)
+  }
 }
 
-run().catch(console.dir)
+run()
 
 app.get('/', (req, res) => {
   res.send('🚀 Parcel server is running!')
 })
 
 app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`)
+  console.log(`🚀 Server running on ${port}`)
 })
