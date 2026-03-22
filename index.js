@@ -1,13 +1,14 @@
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
-const dotenv = require('dotenv')
 const jwt = require('jsonwebtoken')
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb')
 const admin = require('firebase-admin')
-const stripe = require('stripe')(process.env.PAYMENT_GATEWAY_KEY)
+if (!process.env.PAYMENT_GATEWAY_KEY) {
+  throw new Error('❌ Stripe key missing')
+}
 
-dotenv.config()
+const stripe = require('stripe')(process.env.PAYMENT_GATEWAY_KEY)
 
 const app = express()
 const port = process.env.PORT || 5000
@@ -273,12 +274,24 @@ async function run() {
     })
 
     app.patch('/parcels/pay/:id', async (req, res) => {
-      await updateParcelStatus(req.params.id, 'paid')
-      await parcelsCollection.updateOne(
-        { _id: new ObjectId(req.params.id) },
-        { $set: { paymentStatus: 'paid' } },
-      )
-      res.send({ success: true })
+      try {
+        const id = req.params.id
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: 'Invalid ID' })
+        }
+
+        await updateParcelStatus(id, 'paid')
+
+        await parcelsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { paymentStatus: 'paid' } },
+        )
+
+        res.send({ success: true })
+      } catch (error) {
+        res.status(500).send({ message: error.message })
+      }
     })
 
     app.patch(
@@ -461,9 +474,9 @@ async function run() {
     app.get('/tracking/:trackingId', async (req, res) => {
       const trackingId = req.params.trackingId
 
-      const updates = await trackingsCollection
+      const updates = await trackingCollection
         .find({ trackingId: trackingId })
-        .sort({ timestamp: 1 })
+        .sort({ time: 1 })
         .toArray()
 
       res.send(updates)
@@ -471,9 +484,13 @@ async function run() {
 
     // PAYMENTS
     app.get('/payments', verifyFBToken, async (req, res) => {
-      const payments = await paymentCollection
-        .find({ email: req.query.email })
-        .toArray()
+      const email = req.query.email
+
+      if (email !== req.decoded.email) {
+        return res.status(403).send({ message: 'Forbidden' })
+      }
+
+      const payments = await paymentCollection.find({ email }).toArray()
       res.send(payments)
     })
 
@@ -497,26 +514,30 @@ async function run() {
 
     // STRIPE
     app.post('/create-payment-intent', async (req, res) => {
-      const amount = Number(req.body.amountInCents)
+      try {
+        const amount = Number(req.body.amountInCents)
 
-      if (!amount || amount < 50) {
-        return res.status(400).send({ error: 'Invalid amount' })
+        if (!amount || amount < 50) {
+          return res.status(400).send({ error: 'Invalid amount' })
+        }
+
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount,
+          currency: 'usd',
+        })
+
+        res.send({ clientSecret: paymentIntent.client_secret })
+      } catch (error) {
+        console.error('Stripe error:', error.message)
+        res.status(500).send({ message: error.message })
       }
-
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount,
-        currency: 'usd',
-      })
-
-      res.send({ clientSecret: paymentIntent.client_secret })
     })
-  } catch (err) {
-    console.error(err)
+  } catch (error) {
+    console.error('❌ Error connecting to MongoDB:', error)
   }
 }
 
 run()
-
 app.get('/', (req, res) => {
   res.send('🚀 Parcel server is running!')
 })
