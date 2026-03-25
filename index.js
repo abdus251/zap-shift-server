@@ -287,24 +287,6 @@ async function run() {
       res.send(parcel)
     })
 
-    // app.patch('/parcels/pay/:id', async (req, res) => {
-    //   try {
-    //     const id = req.params.id
-    //     if (!ObjectId.isValid(id))
-    //       return res.status(400).send({ message: 'Invalid ID' })
-
-    //     await updateParcelStatus(id, 'paid')
-    //     await parcelsCollection.updateOne(
-    //       { _id: new ObjectId(id) },
-    //       { $set: { paymentStatus: 'paid' } },
-    //     )
-
-    //     res.send({ success: true })
-    //   } catch (error) {
-    //     res.status(500).send({ message: error.message })
-    //   }
-    // })
-
     app.get('/parcels', async (req, res) => {
       const { email, paymentStatus, deliveryStatus } = req.query
 
@@ -346,7 +328,46 @@ async function run() {
         res.status(500).send({ message: error.message })
       }
     })
+    // PATCH /parcels/:id/cashout
+    app.patch('/parcels/:id/cashout', async (req, res) => {
+      try {
+        const { id } = req.params
 
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(id),
+        })
+        if (!parcel)
+          return res
+            .status(404)
+            .send({ success: false, message: 'Parcel not found' })
+
+        if (parcel.cashedOut)
+          return res.send({
+            success: false,
+            message: 'Parcel already cashed out',
+          })
+
+        // Mark as cashed out and store timestamp
+        const updateResult = await parcelsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              cashedOut: true,
+              cashoutAt: new Date(), // ✅ Timestamp
+            },
+          },
+        )
+
+        res.send({
+          success: true,
+          message: 'Parcel cashed out successfully',
+          updateResult,
+        })
+      } catch (err) {
+        console.error(err)
+        res.status(500).send({ success: false, message: 'Server error' })
+      }
+    })
     app.patch(
       '/parcels/assign-rider/:id',
       verifyFBToken,
@@ -685,36 +706,30 @@ async function run() {
       }
     })
 
-    app.get('/riders/status-count', async (req, res) => {
+    // GET /riders/completed-parcels
+    app.get('/riders/completed-parcels', async (req, res) => {
       try {
-        const result = await parcelsCollection
-          .aggregate([
-            {
-              $group: {
-                _id: '$deliveryStatus', // use deliveryStatus instead of status
-                count: { $sum: 1 },
-              },
-            },
-          ])
-          .toArray()
+        const { email } = req.query
 
-        // Ensure all keys exist
-        const formatted = {
-          assigned: 0,
-          in_transit: 0,
-          delivered: 0,
+        // Build query
+        const query = {
+          deliveryStatus: 'delivered', // only delivered parcels
+        }
+        if (email) {
+          query.assignedRiderEmail = email
         }
 
-        result.forEach((item) => {
-          if (item._id === 'assigned') formatted.assigned = item.count
-          if (item._id === 'in_transit') formatted.in_transit = item.count
-          if (item._id === 'delivered') formatted.delivered = item.count
-        })
+        // Sort: first by cashoutAt descending (latest cashed first),
+        // if not cashed out, sort by deliveredAt descending
+        const parcels = await parcelsCollection
+          .find(query)
+          .sort({ cashoutAt: -1, 'history.timestamp': -1 }) // ✅ descending
+          .toArray()
 
-        res.send(formatted)
+        res.send(parcels)
       } catch (error) {
-        console.error(error)
-        res.status(500).send({ message: 'Error getting status counts' })
+        console.error('Error fetching completed parcels:', error)
+        res.status(500).send({ message: 'Failed to get completed parcels' })
       }
     })
     // TRACKING
@@ -736,11 +751,50 @@ async function run() {
     })
 
     // PAYMENTS
+    // GET /payments → for user, rider, admin
     app.get('/payments', verifyFBToken, async (req, res) => {
-      const email = req.decoded.email
+      try {
+        const email = req.decoded.email
 
-      const payments = await paymentCollection.find({ email }).toArray()
-      res.send(payments)
+        // Get the user info from your existing collection
+        const user = await userCollection.findOne({ email })
+        if (!user) return res.status(404).send({ error: 'User not found' })
+
+        let query = {}
+
+        // Admin sees all payments
+        if (user.role !== 'admin') {
+          query.email = email // Non-admins see only their payments
+        }
+
+        const payments = await paymentCollection.find(query).toArray()
+
+        const detailedPayments = await Promise.all(
+          payments.map(async (p) => {
+            const parcel = await parcelsCollection.findOne({
+              _id: new ObjectId(p.parcelId),
+            })
+            return {
+              _id: p._id.toString(),
+              parcelId: p.parcelId,
+              email: p.email,
+              amount: p.amount,
+              paid_at: p.paid_at,
+              trackingNumber: parcel?.trackingNumber || 'N/A',
+            }
+          }),
+        )
+
+        // Sort by latest payment first
+        detailedPayments.sort(
+          (a, b) => new Date(b.paid_at) - new Date(a.paid_at),
+        )
+
+        res.send(detailedPayments)
+      } catch (err) {
+        console.error('Error fetching payments:', err)
+        res.status(500).send({ error: 'Server error' })
+      }
     })
 
     app.post('/payments', async (req, res) => {
@@ -765,7 +819,27 @@ async function run() {
 
       res.send({ success: true, result })
     })
+    app.get('/all-payments', verifyFBToken, async (req, res) => {
+      const user = await usersCollection.findOne({ email: req.decoded.email })
+      if (user.role !== 'admin')
+        return res.status(403).send({ error: 'Forbidden' })
 
+      const payments = await paymentCollection
+        .find()
+        .sort({ paid_at: -1 })
+        .toArray()
+
+      const detailedPayments = await Promise.all(
+        payments.map(async (p) => {
+          const parcel = await parcelsCollection.findOne({
+            _id: new ObjectId(p.parcelId),
+          })
+          return { ...p, trackingNumber: parcel?.trackingNumber || 'N/A' }
+        }),
+      )
+
+      res.send(detailedPayments)
+    })
     // ---------------- STRIPE ----------------
     app.post('/create-payment-intent', async (req, res) => {
       try {
